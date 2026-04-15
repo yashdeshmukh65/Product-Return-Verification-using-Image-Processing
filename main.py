@@ -100,12 +100,17 @@ def process_all(show_plots=True):
         return
 
     for product in products:
-        orig_dir = os.path.join(DATASET_DIR, product, "original")
-        ret_dir  = os.path.join(DATASET_DIR, product, "return")
+        # Handle mixed case folder names (Original/original, Return/return)
+        product_path = os.path.join(DATASET_DIR, product)
+        subfolders = {f.lower(): f for f in os.listdir(product_path)
+                      if os.path.isdir(os.path.join(product_path, f))}
 
-        if not os.path.exists(orig_dir) or not os.path.exists(ret_dir):
+        if "original" not in subfolders or "return" not in subfolders:
             print(f"[SKIP] {product}: missing 'original' or 'return' folder.")
             continue
+
+        orig_dir = os.path.join(product_path, subfolders["original"])
+        ret_dir  = os.path.join(product_path, subfolders["return"])
 
         orig_images = get_images(orig_dir)
         ret_images  = get_images(ret_dir)
