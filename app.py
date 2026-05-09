@@ -16,7 +16,7 @@ from preprocessing import preprocess
 from features import get_features
 from comparison import (
     compute_ssim, pixel_difference, compare_histograms,
-    detect_damage, highlight_damage, decide
+    detect_damage, highlight_damage, decide_enhanced, compare_texture, compare_shape_features
 )
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
@@ -87,20 +87,25 @@ if detect_clicked:
             ret_gray,  ret_color  = preprocess(ret_path)
 
             # ── Feature Extraction (UNIT 4) ───────────────────────────────────
-            _, _, orig_hist = get_features(orig_gray)
-            _, _, ret_hist  = get_features(ret_gray)
+            orig_features = get_features(orig_gray)
+            ret_features  = get_features(ret_gray)
 
             # ── Comparison ────────────────────────────────────────────────────
-            ssim_score = compute_ssim(orig_gray, ret_gray)
-            diff_img   = pixel_difference(orig_gray, ret_gray)
-            hist_score = compare_histograms(orig_hist, ret_hist)
+            ssim_score = compute_ssim(orig_gray, ret_gray, orig_features['mask'], ret_features['mask'])
+            diff_img   = pixel_difference(orig_gray, ret_gray, orig_features['mask'], ret_features['mask'])
+            hist_score = compare_histograms(orig_features['histogram'], ret_features['histogram'])
+            texture_score = compare_texture(orig_features['texture'], ret_features['texture'])
+            shape_score = compare_shape_features(orig_features['shape'], ret_features['shape'])
 
             # ── Damage Detection — morphological operations ───────────────────
-            damage_mask, damaged_pixels = detect_damage(diff_img)
+            damage_mask, damaged_pixels = detect_damage(diff_img, orig_features['mask'], ret_features['mask'])
             damage_overlay = highlight_damage(ret_color, damage_mask)
 
-            # ── Decision ──────────────────────────────────────────────────────
-            result = decide(ssim_score)
+            # ── Enhanced Decision ──────────────────────────────────────────────
+            total_pixels = orig_gray.shape[0] * orig_gray.shape[1]
+            result, composite_score = decide_enhanced(
+                ssim_score, hist_score, texture_score, shape_score, damaged_pixels, total_pixels
+            )
 
             # Cleanup temp files
             os.unlink(orig_path)
@@ -118,10 +123,14 @@ if detect_clicked:
         getattr(st, msg_type)(f"**Result: {label}**")
 
         # ── Score Metrics ─────────────────────────────────────────────────────
-        m1, m2, m3 = st.columns(3)
-        m1.metric("SSIM Score",              f"{ssim_score:.4f}",    help="Structural Similarity (0–1). Higher = more similar.")
-        m2.metric("Histogram Correlation",   f"{hist_score:.4f}",    help="Color/intensity distribution match (0–1).")
-        m3.metric("Damaged Pixels",          f"{damaged_pixels}",    help="Number of pixels flagged as damaged/changed.")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("SSIM Score",              f"{ssim_score:.3f}",      help="Structural Similarity (0–1). Higher = more similar.")
+        m2.metric("Histogram Correlation",   f"{hist_score:.3f}",      help="Color/intensity distribution match (0–1).")
+        m3.metric("Texture Correlation",     f"{texture_score:.3f}",   help="Surface texture similarity (0–1).")
+        m4.metric("Shape Similarity",        f"{shape_score:.3f}",     help="Product shape/outline match (0–1).")
+        m5.metric("Composite Score",         f"{composite_score:.3f}",  help="Overall weighted similarity score.")
+        
+        st.metric("Damaged Pixels", f"{damaged_pixels}", help="Number of pixels flagged as damaged/changed.")
 
         st.divider()
 
@@ -150,8 +159,8 @@ if detect_clicked:
         fig, ax = plt.subplots(figsize=(8, 2.5))
         fig.patch.set_facecolor("#1e1e2e")
         ax.set_facecolor("#2a2a3e")
-        ax.plot(orig_hist, color="#7c3aed", label="Original", linewidth=1.5)
-        ax.plot(ret_hist,  color="#f59e0b", label="Returned",  linewidth=1.5)
+        ax.plot(orig_features['histogram'], color="#7c3aed", label="Original", linewidth=1.5)
+        ax.plot(ret_features['histogram'],  color="#f59e0b", label="Returned",  linewidth=1.5)
         ax.legend(facecolor="#2a2a3e", labelcolor="white")
         ax.tick_params(colors="white")
         for spine in ax.spines.values():

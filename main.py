@@ -56,20 +56,25 @@ def compare_pair(orig_path, ret_path, show_plot=True):
     ret_gray,  ret_color  = preprocess(ret_path)
 
     # ── Feature Extraction (UNIT 4) ─────────────────────────────────────────
-    _, _, orig_hist = get_features(orig_gray)
-    _, _, ret_hist  = get_features(ret_gray)
+    orig_features = get_features(orig_gray)
+    ret_features  = get_features(ret_gray)
 
     # ── Comparison ──────────────────────────────────────────────────────────
-    ssim_score  = compute_ssim(orig_gray, ret_gray)
-    diff_img    = pixel_difference(orig_gray, ret_gray)
-    hist_score  = compare_histograms(orig_hist, ret_hist)
+    ssim_score  = compute_ssim(orig_gray, ret_gray, orig_features['mask'], ret_features['mask'])
+    diff_img    = pixel_difference(orig_gray, ret_gray, orig_features['mask'], ret_features['mask'])
+    hist_score  = compare_histograms(orig_features['histogram'], ret_features['histogram'])
+    texture_score = compare_texture(orig_features['texture'], ret_features['texture'])
+    shape_score = compare_shape_features(orig_features['shape'], ret_features['shape'])
 
     # ── Damage Detection (morphological operations) ──────────────────────────
-    damage_mask, damaged_pixels = detect_damage(diff_img)
+    damage_mask, damaged_pixels = detect_damage(diff_img, orig_features['mask'], ret_features['mask'])
     damage_overlay = highlight_damage(ret_color, damage_mask)
 
-    # ── Decision ────────────────────────────────────────────────────────────
-    result = decide(ssim_score)
+    # ── Enhanced Decision ────────────────────────────────────────────────────
+    total_pixels = orig_gray.shape[0] * orig_gray.shape[1]
+    result, composite_score = decide_enhanced(
+        ssim_score, hist_score, texture_score, shape_score, damaged_pixels, total_pixels
+    )
 
     # Convert diff to 3-channel for display
     diff_display = cv2.cvtColor(diff_img, cv2.COLOR_GRAY2BGR)
@@ -78,7 +83,7 @@ def compare_pair(orig_path, ret_path, show_plot=True):
         title = f"{os.path.basename(orig_path)}  vs  {os.path.basename(ret_path)}"
         display_result(orig_color, ret_color, diff_display, damage_overlay, result, ssim_score, title)
 
-    return result, ssim_score, hist_score, damaged_pixels
+    return result, ssim_score, hist_score, damaged_pixels, composite_score, texture_score, shape_score
 
 
 def process_all(show_plots=True):
@@ -126,12 +131,12 @@ def process_all(show_plots=True):
 
         for orig_path in orig_images:
             for ret_path in ret_images:
-                result, ssim, hist_corr, dmg_px = compare_pair(
+                result, ssim, hist_corr, dmg_px, composite, texture, shape = compare_pair(
                     orig_path, ret_path, show_plot=show_plots
                 )
                 print(
                     f"  {os.path.basename(orig_path):20s} vs {os.path.basename(ret_path):20s}"
-                    f"  →  {result:10s}  SSIM={ssim:.4f}  HistCorr={hist_corr:.4f}  DamagedPx={dmg_px}"
+                    f"  →  {result:10s}  SSIM={ssim:.3f}  Hist={hist_corr:.3f}  Tex={texture:.3f}  Shape={shape:.3f}  Composite={composite:.3f}  DmgPx={dmg_px}"
                 )
 
 
