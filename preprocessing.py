@@ -1,8 +1,7 @@
 """
 preprocessing.py
 UNIT 3 - Image Enhancement & Spatial Filtering
-Pipeline: Input → Segmentation → ROI Extraction → CLAHE → Output
-Handles: polygon ROI, product segmentation, CLAHE enhancement
+Pipeline: Input -> K-Means Segmentation -> Polygon ROI Extraction -> CLAHE -> Output
 """
 
 import cv2
@@ -19,145 +18,127 @@ def load_image(path):
     return img
 
 
-def create_polygon_roi(img, method='auto'):
+def kmeans_segmentation(img, k=3):
     """
-    Create polygon ROI for precise product region extraction.
-    Methods: 'auto' (automatic detection) or 'manual' (interactive selection)
+    K-Means Segmentation (UNIT 3):
+    Clusters image pixels into K color groups.
+    The largest non-background cluster = product region.
+    
+    Steps:
+    1. Reshape image to list of pixels
+    2. Apply K-Means clustering (k=3: background, product, shadow/edge)
+    3. Identify background cluster (largest cluster touching image border)
+    4. Create binary mask: product=255, background=0
+    5. Morphological cleanup
     """
     h, w = img.shape[:2]
-    
-    if method == 'auto':
-        # Automatic polygon ROI using edge detection and contour approximation
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Edge detection with adaptive thresholds
-        edges = cv2.Canny(blurred, 50, 150)
-        
-        # Find contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # Find the largest contour (likely the product)
-            largest_contour = max(contours, key=cv2.contourArea)
-            
-            # Approximate contour to polygon
-            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
-            poly_roi = cv2.approxPolyDP(largest_contour, epsilon, True)
-            
-            # Ensure minimum area
-            if cv2.contourArea(poly_roi) > (w * h * 0.1):  # At least 10% of image
-                return poly_roi.reshape(-1, 2)
-    
-    # Fallback: Create rectangular ROI around center
-    margin = 0.15  # 15% margin from edges
-    x1, y1 = int(w * margin), int(h * margin)
-    x2, y2 = int(w * (1 - margin)), int(h * (1 - margin))
-    
-    return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
+
+    # Step 1: Reshape to (N, 3) pixel array for K-Means
+    pixel_data = img.reshape((-1, 3)).astype(np.float32)
+
+    # Step 2: K-Means clustering
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(
+        pixel_data, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS
+    )
+
+    # Reshape labels back to image shape
+    labels = labels.reshape((h, w))
+
+    # Step 3: Identify background cluster
+    # Background = cluster that has most pixels touching the image border
+    border_pixels = np.concatenate([
+        labels[0, :],        # top row
+        labels[-1, :],       # bottom row
+        labels[:, 0],        # left column
+        labels[:, -1]        # right column
+    ])
+
+    # Count which cluster dominates the border
+    border_counts = np.bincount(border_pixels.astype(np.int32), minlength=k)
+    bg_label = np.argmax(border_counts)
+
+    # Step 4: Create binary mask — product = 255, background = 0
+    product_mask = np.where(labels != bg_label, 255, 0).astype(np.uint8)
+
+    # Step 5: Morphological cleanup
+    kernel = np.ones((7, 7), np.uint8)
+    product_mask = cv2.morphologyEx(product_mask, cv2.MORPH_CLOSE, kernel)  # Fill gaps
+    product_mask = cv2.morphologyEx(product_mask, cv2.MORPH_OPEN, kernel)   # Remove noise
+
+    return product_mask
 
 
-def extract_roi_with_polygon(img, poly_points):
+def get_polygon_roi(product_mask):
     """
-    Extract Region of Interest using polygon mask.
-    Returns the cropped image containing only the product region.
+    Extract polygon ROI from K-Means product mask.
+    Finds the largest contour and approximates it to a polygon.
     """
-    # Create mask from polygon
-    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [poly_points.astype(np.int32)], 255)
-    
-    # Apply mask to image
-    masked_img = cv2.bitwise_and(img, img, mask=mask)
-    
-    # Find bounding rectangle of the polygon
-    x, y, w, h = cv2.boundingRect(poly_points.astype(np.int32))
-    
+    contours, _ = cv2.findContours(product_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        # Fallback: center region polygon
+        h, w = product_mask.shape
+        m = 0.15
+        return np.array([
+            [int(w*m), int(h*m)], [int(w*(1-m)), int(h*m)],
+            [int(w*(1-m)), int(h*(1-m))], [int(w*m), int(h*(1-m))]
+        ])
+
+    # Largest contour = main product
+    largest = max(contours, key=cv2.contourArea)
+
+    # Douglas-Peucker polygon approximation
+    epsilon = 0.015 * cv2.arcLength(largest, True)
+    polygon = cv2.approxPolyDP(largest, epsilon, True)
+
+    return polygon.reshape(-1, 2)
+
+
+def extract_roi(img, polygon):
+    """
+    Extract product ROI using polygon mask.
+    Returns segmented color image (background filled with mean color).
+    """
+    h, w = img.shape[:2]
+
+    # Create polygon mask
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
+
+    # Apply mask
+    masked = cv2.bitwise_and(img, img, mask=mask)
+
     # Crop to bounding rectangle
-    cropped_img = masked_img[y:y+h, x:x+w]
-    cropped_mask = mask[y:y+h, x:x+w]
-    
-    # Replace masked areas with mean color to avoid black regions
+    x, y, bw, bh = cv2.boundingRect(polygon.astype(np.int32))
+    x, y = max(0, x), max(0, y)
+    bw = min(bw, w - x)
+    bh = min(bh, h - y)
+
+    cropped = masked[y:y+bh, x:x+bw]
+    cropped_mask = mask[y:y+bh, x:x+bw]
+
+    # Fill non-product pixels with mean product color (no black artifacts)
     if np.sum(cropped_mask) > 0:
-        mean_color = cv2.mean(cropped_img, mask=cropped_mask)[:3]
-        cropped_img[cropped_mask == 0] = mean_color
-    
-    return cropped_img, cropped_mask
+        mean_color = cv2.mean(cropped, mask=cropped_mask)[:3]
+        cropped[cropped_mask == 0] = mean_color
 
+    # Safety check: ensure valid crop
+    if cropped.shape[0] < 10 or cropped.shape[1] < 10:
+        return img
 
-def advanced_segmentation(img):
-    """
-    Advanced product segmentation using multiple techniques.
-    Combines edge detection, color segmentation, and morphological operations.
-    """
-    # Convert to different color spaces for better segmentation
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    
-    # Method 1: Edge-based segmentation
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 30, 100)
-    
-    # Method 2: Color-based segmentation (remove background colors)
-    # Assume background is often white/light colored
-    lower_bg = np.array([0, 0, 200])  # Light colors in HSV
-    upper_bg = np.array([180, 30, 255])
-    bg_mask = cv2.inRange(hsv, lower_bg, upper_bg)
-    fg_mask = cv2.bitwise_not(bg_mask)
-    
-    # Combine edge and color information
-    combined = cv2.bitwise_or(edges, fg_mask)
-    
-    # Morphological operations to clean up
-    kernel = np.ones((3, 3), np.uint8)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
-    
-    # Find contours and select the largest one
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-        
-        # Create polygon ROI from contour
-        epsilon = 0.015 * cv2.arcLength(largest_contour, True)
-        poly_roi = cv2.approxPolyDP(largest_contour, epsilon, True)
-        
-        return poly_roi.reshape(-1, 2)
-    
-    # Fallback to center region
-    h, w = img.shape[:2]
-    margin = 0.2
-    x1, y1 = int(w * margin), int(h * margin)
-    x2, y2 = int(w * (1 - margin)), int(h * (1 - margin))
-    
-    return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
-
-
-def resize_image(img):
-    """Spatial operation: resize to fixed dimensions for consistent comparison."""
-    return cv2.resize(img, TARGET_SIZE)
-
-
-def to_grayscale(img):
-    """Convert BGR to grayscale — reduces 3-channel to single intensity channel."""
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cropped
 
 
 def apply_gaussian_blur(gray_img, kernel_size=(3, 3)):
-    """
-    Spatial Filtering (UNIT 3): Gaussian blur for noise removal.
-    Uses a weighted average kernel — pixels closer to center have higher weight.
-    """
+    """Spatial Filtering (UNIT 3): Gaussian blur for noise removal."""
     return cv2.GaussianBlur(gray_img, kernel_size, 0)
 
 
 def clahe_enhancement(gray_img, clip_limit=3.0, tile_size=(8, 8)):
     """
     CLAHE - Contrast Limited Adaptive Histogram Equalization (UNIT 3).
-    Final step: applies adaptive contrast enhancement to the ROI.
-    Enhanced parameters for better product visibility.
+    Applies adaptive contrast enhancement tile-by-tile.
     """
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
     return clahe.apply(gray_img)
@@ -165,40 +146,35 @@ def clahe_enhancement(gray_img, clip_limit=3.0, tile_size=(8, 8)):
 
 def preprocess(path):
     """
-    Enhanced preprocessing pipeline following your specified flow:
-    
-    Input Images → Segmentation → ROI Extraction → CLAHE → Output
-    
-    Steps:
-    1. Load input image
-    2. Segmentation: Advanced product segmentation with polygon ROI
-    3. ROI Extraction: Extract product region using polygon mask
-    4. Resize to standard dimensions
-    5. Convert to grayscale
-    6. Apply Gaussian blur
-    7. CLAHE: Adaptive contrast enhancement
-    
-    Returns both the processed grayscale image and the processed color image.
+    Full pipeline:
+    Input -> K-Means Segmentation -> Polygon ROI Extraction -> Resize -> Grayscale -> Blur -> CLAHE
+
+    Returns:
+        enhanced  : preprocessed grayscale image (for comparison)
+        segmented : segmented color image (for display in UI)
     """
-    # Step 1: Input Images
+    # Step 1: Load
     img = load_image(path)
-    
-    # Step 2: Segmentation - Create polygon ROI for product
-    poly_roi = advanced_segmentation(img)
-    
-    # Step 3: ROI Extraction - Extract product region using polygon
-    roi_img, roi_mask = extract_roi_with_polygon(img, poly_roi)
-    
-    # Resize extracted ROI to standard size
-    resized_img = resize_image(roi_img)
-    
-    # Convert to grayscale
-    gray = to_grayscale(resized_img)
-    
-    # Apply light Gaussian blur for noise reduction
+
+    # Step 2: K-Means Segmentation
+    product_mask = kmeans_segmentation(img, k=3)
+
+    # Step 3: Polygon ROI from mask
+    polygon = get_polygon_roi(product_mask)
+
+    # Step 4: Extract ROI (product only, background removed)
+    segmented = extract_roi(img, polygon)
+
+    # Step 5: Resize to standard size
+    resized = cv2.resize(segmented, TARGET_SIZE)
+
+    # Step 6: Grayscale
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+    # Step 7: Gaussian Blur
     blurred = apply_gaussian_blur(gray)
-    
-    # Step 4: CLAHE - Final adaptive contrast enhancement
+
+    # Step 8: CLAHE
     enhanced = clahe_enhancement(blurred)
-    
-    return enhanced, resized_img  # (processed grayscale, processed color for display)
+
+    return enhanced, resized  # (grayscale for processing, color for display)
