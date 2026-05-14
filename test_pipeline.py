@@ -6,7 +6,7 @@ Test the enhanced pipeline: Input → Segmentation → ROI Extraction → CLAHE 
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from preprocessing import preprocess, preprocess_pair
+from preprocessing import preprocess
 from features import get_features
 from comparison import compute_ssim, decide_enhanced
 
@@ -22,9 +22,12 @@ def test_pipeline():
         print("=" * 50)
         
         # Step 1: Input Images → Segmentation → ROI Extraction → CLAHE
-        print("Step 1: Processing Original Image and Return Image Pair...")
-        (orig_gray, orig_color), (ret_gray, ret_color) = preprocess_pair(orig_path, ret_path)
+        print("Step 1: Processing Original Image...")
+        orig_gray, orig_color = preprocess(orig_path)
         print(f"  Original processed: {orig_gray.shape}")
+        
+        print("Step 2: Processing Return Image...")
+        ret_gray, ret_color = preprocess(ret_path)
         print(f"  Return processed: {ret_gray.shape}")
         
         # Step 3: Feature Extraction

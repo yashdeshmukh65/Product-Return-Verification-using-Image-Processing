@@ -3,218 +3,204 @@ preprocessing.py
 UNIT 3 - Image Enhancement & Spatial Filtering
 
 Pipeline:
-  Input
-    -> LAB Color Conversion
-    -> K-Means Clustering (k=2) on LAB
-    -> Morphological Opening + Closing
-    -> Largest Contour Detection
-    -> Clean Binary Mask (product only)
-    -> GrabCut Refinement
-    -> Background = Black (complete removal)
-    -> Tight Bounding Box Crop
-    -> Resize -> Grayscale -> Gaussian Blur -> CLAHE
+  Load -> Resize
+    -> LAB + CLAHE (illumination normalization)
+    -> GrabCut foreground extraction
+    -> Morphological Closing
+    -> Canny Edge Detection
+    -> Largest Centered Contour
+    -> Clean Binary Mask
+    -> Background = Pure Black
+    -> Tight Crop -> Resize to 256x256
+    -> Grayscale -> Gaussian Blur -> CLAHE
 """
 
 import cv2
 import numpy as np
 
-TARGET_SIZE = (256, 256)
+WORK_SIZE   = (512, 512)
+OUTPUT_SIZE = (256, 256)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
 def load_image(path):
-    """Load image from disk in BGR format."""
     img = cv2.imread(path)
     if img is None:
         raise FileNotFoundError(f"Cannot load image: {path}")
     return img
 
 
-def kmeans_lab(img, k=2):
+# ─── STEP 1: LAB + CLAHE illumination normalization ───────────────────────────
+def normalize_lab_clahe(img):
     """
-    Step 1+2 — LAB Color Conversion + K-Means Clustering (k=2):
+    Convert to LAB and apply CLAHE only on the L (lightness) channel.
+    This normalizes illumination differences (shadows, reflections, lighting)
+    before segmentation so GrabCut clusters on color/texture, not brightness.
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    Why LAB?
-    - L channel = lightness (separates brightness from color)
-    - A channel = green-red axis
-    - B channel = blue-yellow axis
-    - LAB is perceptually uniform — similar colors cluster better than BGR
-    - Separates product from background more cleanly under varied lighting
 
-    Why k=2?
-    - Only 2 clusters needed: foreground (product) vs background
-    - Simpler, faster, and more reliable than k=3 for binary separation
+# ─── STEP 2: GrabCut foreground extraction ────────────────────────────────────
+def grabcut_segment(img):
+    """
+    GrabCut initialized with a center rectangle (product assumed in center).
+    Uses iterative graph-cut optimization with Gaussian Mixture Models
+    to separate foreground (product) from background at pixel level.
+    More robust than K-Means when product and background share similar colors.
+
+    Rect margin: 8% from each edge — assumes product occupies center region.
+    5 iterations for stable convergence.
     """
     h, w = img.shape[:2]
+    margin_x = int(w * 0.08)
+    margin_y = int(h * 0.08)
+    rect = (margin_x, margin_y,
+            w - 2 * margin_x,
+            h - 2 * margin_y)
 
-    # Convert BGR -> LAB for perceptually uniform clustering
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    mask    = np.zeros((h, w), np.uint8)
+    bgd     = np.zeros((1, 65), np.float64)
+    fgd     = np.zeros((1, 65), np.float64)
 
-    # Reshape to flat pixel list (N, 3)
-    pixel_data = lab.reshape((-1, 3)).astype(np.float32)
+    cv2.grabCut(img, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
 
-    # K-Means with k=2: foreground vs background
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
-    _, labels, centers = cv2.kmeans(
-        pixel_data, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS
-    )
+    # Definite + probable foreground = product
+    fg_mask = np.where(
+        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
+    ).astype(np.uint8)
 
-    labels = labels.reshape((h, w)).astype(np.uint8)
-
-    # Identify background cluster: dominates image border pixels
-    border = np.concatenate([
-        labels[0, :], labels[-1, :],
-        labels[:, 0], labels[:, -1]
-    ])
-    border_counts = np.bincount(border.astype(np.int32), minlength=k)
-    bg_label = int(np.argmax(border_counts))
-    fg_label = 1 - bg_label  # Since k=2, foreground is the other label
-
-    # Raw binary mask: product=255, background=0
-    raw_mask = np.where(labels == fg_label, 255, 0).astype(np.uint8)
-
-    return raw_mask
+    return fg_mask
 
 
-def morphological_cleanup(mask):
+# ─── STEP 3: Morphological Closing ────────────────────────────────────────────
+def morph_close(mask):
     """
-    Step 3 — Morphological Opening + Closing:
-
-    OPENING  (erode then dilate):
-    - Removes small isolated noise blobs outside the product
-    - Breaks thin connections between product and background
-
-    CLOSING  (dilate then erode):
-    - Fills small holes and gaps inside the product region
-    - Connects nearby product fragments into one solid region
-
-    Two passes of each for thorough cleanup on phone camera images.
+    Morphological Closing (dilate then erode):
+    Fills small holes and gaps left by GrabCut inside the product region.
+    Connects nearby foreground fragments into one solid region.
+    Elliptical kernel avoids sharp rectangular artifacts.
     """
-    kernel_open  = np.ones((5, 5), np.uint8)
-    kernel_close = np.ones((11, 11), np.uint8)
-
-    # Opening first: remove noise
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open,  iterations=2)
-    # Closing second: fill gaps
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-
-    return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
 
 
-def get_largest_contour_mask(mask, img_shape):
+# ─── STEP 4: Canny Edge Detection ─────────────────────────────────────────────
+def canny_edges(img, mask):
     """
-    Step 4+5 — Largest Contour Detection + Clean Binary Mask:
+    Canny edge detection on the GrabCut-masked region only.
+    Detects sharp intensity transitions at product boundaries and surface features.
+    Combined with the GrabCut mask to reinforce product boundary detection.
+    Thresholds 40/120 tuned for product images with varied textures.
+    """
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Apply mask before edge detection — ignore background edges
+    masked_gray = cv2.bitwise_and(gray, gray, mask=mask)
+    blurred     = cv2.GaussianBlur(masked_gray, (5, 5), 0)
+    edges       = cv2.Canny(blurred, 40, 120)
+    # Combine edges with GrabCut mask
+    combined    = cv2.bitwise_or(mask, edges)
+    return combined
 
-    - Detect ALL external contours from the cleaned mask
-    - Select ONLY the single largest contour = main product
-    - Discard every other contour (shadows, reflections, noise fragments)
-    - Draw a fresh filled mask using ONLY this largest contour
-    - Result: perfectly clean binary mask with zero background fragments
+
+# ─── STEP 5: Largest Centered Contour ─────────────────────────────────────────
+def get_largest_centered_contour(combined_mask, img_shape):
+    """
+    Detect all external contours from the combined GrabCut+Canny mask.
+    Filter by minimum area (3% of image) to remove noise fragments.
+    Score each valid contour by:
+      - Area score (70%): larger contour = more likely the product
+      - Center score (30%): closer to image center = more likely product
+    Select the highest-scoring contour as the main product.
+    Draw a FRESH filled mask from ONLY this contour.
+    All other contours (shadows, reflections, background objects) are discarded.
     """
     h, w = img_shape[:2]
+    cx, cy   = w // 2, h // 2
+    min_area = h * w * 0.03
+    max_dist = np.sqrt(cx**2 + cy**2)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    if not contours:
-        # Fallback: center 70% region
-        clean = np.zeros((h, w), dtype=np.uint8)
-        m = 0.15
-        cv2.rectangle(clean,
-                      (int(w * m), int(h * m)),
-                      (int(w * (1-m)), int(h * (1-m))),
+    valid = [c for c in contours if cv2.contourArea(c) >= min_area]
+
+    if not valid:
+        # Fallback: center 70% rectangle
+        fb = np.zeros((h, w), dtype=np.uint8)
+        m  = 0.15
+        cv2.rectangle(fb,
+                      (int(w*m), int(h*m)),
+                      (int(w*(1-m)), int(h*(1-m))),
                       255, -1)
-        return clean, None
+        return fb, None
 
-    # Pick the single largest contour
-    largest = max(contours, key=cv2.contourArea)
+    max_area = max(cv2.contourArea(c) for c in valid)
 
-    # Minimum area check: must cover at least 3% of image
-    if cv2.contourArea(largest) < (h * w * 0.03):
-        clean = np.zeros((h, w), dtype=np.uint8)
-        m = 0.15
-        cv2.rectangle(clean,
-                      (int(w * m), int(h * m)),
-                      (int(w * (1-m)), int(h * (1-m))),
-                      255, -1)
-        return clean, None
+    def score(c):
+        area = cv2.contourArea(c)
+        M    = cv2.moments(c)
+        if M['m00'] == 0:
+            return 0.0
+        ccx  = M['m10'] / M['m00']
+        ccy  = M['m01'] / M['m00']
+        dist = np.sqrt((ccx - cx)**2 + (ccy - cy)**2)
+        return 0.70 * (area / max_area) + 0.30 * (1.0 - dist / max_dist)
 
-    # Draw ONLY the largest contour — completely fresh mask
-    # All other background fragments are gone
+    best  = max(valid, key=score)
+
     clean = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(clean, [largest], -1, 255, thickness=cv2.FILLED)
+    cv2.drawContours(clean, [best], -1, 255, thickness=cv2.FILLED)
 
-    return clean, largest
+    return clean, best
 
 
-def grabcut_refinement(img, contour_mask, largest_contour):
+# ─── STEP 6: GrabCut refinement pass 2 (optional) ────────────────────────────
+def grabcut_refine_with_mask(img, contour_mask, best_contour):
     """
-    Step 6 — GrabCut Refinement:
-
-    Uses the largest contour mask as initialization for GrabCut.
-    GrabCut builds Gaussian Mixture Models for foreground and background
-    and iteratively refines the boundary at pixel level.
-
-    Initialization:
-    - GC_FGD (definite foreground): pixels inside eroded contour mask
-    - GC_PR_FGD (probable foreground): pixels inside contour mask
-    - GC_BGD (definite background): pixels outside dilated contour mask
-    - GC_PR_BGD (probable background): remaining pixels
-
-    Falls back to contour_mask if GrabCut fails or produces poor result.
+    Second GrabCut pass initialized from the largest contour mask.
+    Provides pixel-precise boundary refinement after contour selection.
+    Three initialization zones:
+      - Definite BG: outside dilated contour
+      - Probable FG: inside contour mask
+      - Definite FG: inside heavily eroded contour (core product)
+    Falls back to contour_mask on failure.
     """
     h, w = img.shape[:2]
-
-    if largest_contour is None:
-        return contour_mask
-
-    # Get bounding rect from largest contour
-    x, y, bw, bh = cv2.boundingRect(largest_contour)
-
-    # Add padding
-    pad = 15
-    x  = max(0, x - pad)
-    y  = max(0, y - pad)
-    bw = min(w - x, bw + 2 * pad)
-    bh = min(h - y, bh + 2 * pad)
-
-    if bw < 30 or bh < 30:
+    if best_contour is None:
         return contour_mask
 
     try:
-        # Build GrabCut initialization mask from contour mask
-        gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+        ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+        kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
 
-        # Definite background: outside dilated contour
-        kernel = np.ones((15, 15), np.uint8)
-        dilated = cv2.dilate(contour_mask, kernel, iterations=2)
-        gc_mask[dilated == 0] = cv2.GC_BGD
+        eroded  = cv2.erode(contour_mask,  ke, iterations=3)
+        dilated = cv2.dilate(contour_mask, kd, iterations=3)
 
-        # Probable foreground: inside contour mask
-        gc_mask[contour_mask == 255] = cv2.GC_PR_FGD
+        gc = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+        gc[dilated == 0]          = cv2.GC_BGD
+        gc[contour_mask == 255]   = cv2.GC_PR_FGD
+        gc[eroded == 255]         = cv2.GC_FGD
 
-        # Definite foreground: inside eroded contour (core product)
-        eroded = cv2.erode(contour_mask, kernel, iterations=2)
-        gc_mask[eroded == 255] = cv2.GC_FGD
+        bgd = np.zeros((1, 65), np.float64)
+        fgd = np.zeros((1, 65), np.float64)
 
-        bgd_model = np.zeros((1, 65), np.float64)
-        fgd_model = np.zeros((1, 65), np.float64)
+        cv2.grabCut(img, gc, None, bgd, fgd, 5, cv2.GC_INIT_WITH_MASK)
 
-        # Run GrabCut using mask initialization (5 iterations)
-        cv2.grabCut(img, gc_mask, None, bgd_model, fgd_model, 5,
-                    cv2.GC_INIT_WITH_MASK)
-
-        # Extract foreground: definite + probable foreground
         refined = np.where(
-            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
-            255, 0
+            (gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0
         ).astype(np.uint8)
 
-        # Validate: must have reasonable coverage
-        if np.sum(refined == 255) < (h * w * 0.03):
+        if np.sum(refined == 255) < (h * w * 0.02):
             return contour_mask
 
-        # Final closing to fill any holes GrabCut left
-        k2 = np.ones((7, 7), np.uint8)
-        refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, k2)
+        kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kc)
 
         return refined
 
@@ -222,108 +208,101 @@ def grabcut_refinement(img, contour_mask, largest_contour):
         return contour_mask
 
 
-def extract_product(img, final_mask):
+# ─── STEP 7: Extract clean product ────────────────────────────────────────────
+def extract_clean_product(img, final_mask):
     """
-    Step 7 — Product Extraction:
-
-    - Set ALL background pixels to pure black (0,0,0)
-    - Crop tightly to the product bounding box
-    - Result: only the product object, zero background contamination
-    - This ensures SSIM and damage detection operate on product only
+    Set ALL background pixels to pure black (0, 0, 0).
+    Tight bounding box crop around non-zero mask pixels.
+    Pure black background ensures pixel_difference() and SSIM
+    never include background in their calculations.
     """
-    h, w = img.shape[:2]
+    product = img.copy()
+    product[final_mask == 0] = 0
 
-    # Set background pixels to black — complete removal
-    product_only = img.copy()
-    product_only[final_mask == 0] = 0
-
-    # Tight crop to bounding box of non-zero mask pixels
     coords = cv2.findNonZero(final_mask)
     if coords is None:
-        return product_only
+        return product
 
     x, y, bw, bh = cv2.boundingRect(coords)
-    x  = max(0, x)
-    y  = max(0, y)
-    bw = min(bw, w - x)
-    bh = min(bh, h - y)
+    x  = max(0, x);  y  = max(0, y)
+    bw = min(bw, img.shape[1] - x)
+    bh = min(bh, img.shape[0] - y)
 
-    cropped = product_only[y:y+bh, x:x+bw]
-
-    if cropped.shape[0] < 20 or cropped.shape[1] < 20:
-        return product_only
-
-    return cropped
+    cropped = product[y:y+bh, x:x+bw]
+    return cropped if cropped.shape[0] >= 20 and cropped.shape[1] >= 20 else product
 
 
-def apply_gaussian_blur(gray_img, kernel_size=(3, 3)):
-    """Spatial Filtering (UNIT 3): Gaussian blur for noise removal."""
-    return cv2.GaussianBlur(gray_img, kernel_size, 0)
-
-
-def clahe_enhancement(gray_img, clip_limit=3.0, tile_size=(8, 8)):
+# ─── STEP 8: Illumination normalization ───────────────────────────────────────
+def remove_illumination(gray):
     """
-    CLAHE — Contrast Limited Adaptive Histogram Equalization (UNIT 3).
-    Divides image into 8x8 tiles, applies independent contrast per tile.
-    clip_limit=3.0 prevents noise over-amplification.
+    Subtract large-scale illumination field estimated by heavy Gaussian blur.
+    Removes gradients caused by shadows, uneven lighting, and reflections.
+    Result is normalized to 0-255 range.
     """
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
-    return clahe.apply(gray_img)
+    illum     = cv2.GaussianBlur(gray.astype(np.float32), (61, 61), 0)
+    corrected = np.clip(gray.astype(np.float32) - illum + 128.0, 0, 255)
+    return corrected.astype(np.uint8)
 
 
-def preprocess(path, use_grabcut=True):
+# ─── MAIN PREPROCESS ──────────────────────────────────────────────────────────
+def preprocess(path):
     """
-    Complete preprocessing pipeline:
-
-    Input
-      -> LAB Color Conversion
-      -> K-Means (k=2)                  [foreground vs background]
-      -> Morphological Open + Close     [noise removal + gap filling]
-      -> Largest Contour Detection      [select main product only]
-      -> Clean Binary Mask              [all background fragments removed]
-      -> GrabCut Refinement             [pixel-precise boundary]
-      -> Background = Black             [complete background removal]
-      -> Tight Bounding Box Crop        [product-only region]
-      -> Resize to 256x256
-      -> Grayscale
-      -> Gaussian Blur
+    Full pipeline:
+    Load -> Resize(512)
+      -> LAB+CLAHE normalization
+      -> GrabCut (rect init)
+      -> Morphological Closing
+      -> Canny edges (on masked region)
+      -> Largest Centered Contour
+      -> GrabCut refinement (mask init)
+      -> Pure black background
+      -> Tight crop -> Resize(256)
+      -> Grayscale -> Gaussian Blur
+      -> Illumination removal
       -> CLAHE
 
     Returns:
-        enhanced  (256x256 grayscale) — for SSIM, features, damage detection
-        segmented (256x256 BGR)       — for UI display (product only, black bg)
+        enhanced  (256x256 grayscale) — for SSIM / features / damage
+        segmented (256x256 BGR)       — for UI display (black background)
     """
-    # Load
     img = load_image(path)
+    img = cv2.resize(img, WORK_SIZE, interpolation=cv2.INTER_AREA)
 
-    # LAB K-Means (k=2)
-    raw_mask = kmeans_lab(img, k=2)
+    # Illumination normalization before segmentation
+    norm_img = normalize_lab_clahe(img)
 
-    # Morphological cleanup
-    clean_mask = morphological_cleanup(raw_mask)
+    # GrabCut pass 1 (rect init)
+    gc_mask = grabcut_segment(norm_img)
 
-    # Largest contour → clean product-only mask
-    contour_mask, largest_contour = get_largest_contour_mask(clean_mask, img.shape)
+    # Morphological closing
+    closed = morph_close(gc_mask)
 
-    # GrabCut refinement
-    if use_grabcut:
-        final_mask = grabcut_refinement(img, contour_mask, largest_contour)
-    else:
-        final_mask = contour_mask
+    # Canny + combine
+    combined = canny_edges(norm_img, closed)
 
-    # Extract product (background = black, tight crop)
-    product_img = extract_product(img, final_mask)
+    # Largest centered contour
+    contour_mask, best_contour = get_largest_centered_contour(combined, img.shape)
 
-    # Resize
-    resized = cv2.resize(product_img, TARGET_SIZE)
+    # GrabCut pass 2 (mask init refinement)
+    final_mask = grabcut_refine_with_mask(norm_img, contour_mask, best_contour)
+
+    # Extract product (pure black BG, tight crop)
+    product = extract_clean_product(img, final_mask)
+
+    # Resize to output
+    resized = cv2.resize(product, OUTPUT_SIZE, interpolation=cv2.INTER_AREA)
 
     # Grayscale
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
-    # Gaussian Blur
-    blurred = apply_gaussian_blur(gray)
+    # Gaussian blur
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Remove illumination gradients
+    normalized = remove_illumination(blurred)
 
     # CLAHE
-    enhanced = clahe_enhancement(blurred)
+    clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(normalized)
 
     return enhanced, resized

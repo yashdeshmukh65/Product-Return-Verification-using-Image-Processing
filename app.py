@@ -132,14 +132,14 @@ if detect_clicked:
         st.divider()
 
         # ── Decision Info ─────────────────────────────────────────────────────
-        with st.expander("📊 How the decision was made"):
+        with st.expander("How the decision was made"):
             st.markdown("""
 | Composite Score | Damage Ratio | Decision |
 |---|---|---|
-| > 0.75 | < 5% | ✅ SAME |
-| 0.45 – 0.75 | > 15% | ⚠️ DAMAGED |
-| 0.45 – 0.75 | < 15% | ⚠️ DAMAGED / ❌ DIFFERENT |
-| < 0.45 | Any | ❌ DIFFERENT |
+| > 0.55 | < 8% | SAME |
+| 0.35 - 0.55 | > 12% | DAMAGED |
+| 0.35 - 0.55 | < 12% | DAMAGED / DIFFERENT |
+| < 0.35 | Any | DIFFERENT |
             """)
             st.progress(float(np.clip(composite_score, 0, 1)), text=f"Composite Score: {composite_score:.3f}")
 
