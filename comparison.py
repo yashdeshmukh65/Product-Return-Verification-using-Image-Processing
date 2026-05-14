@@ -235,25 +235,31 @@ def compute_composite_score(ssim, hist, texture, shape, damaged_px, total_px):
 # ─── Decision ─────────────────────────────────────────────────────────────────
 def decide_enhanced(ssim, hist, texture, shape, damaged_px, total_px):
     """
-    Multi-criteria decision using composite score:
-      Composite > 0.55 and damage < 8%    -> SAME
-      Composite 0.35-0.55, SSIM > 0.30    -> DAMAGED or DIFFERENT
-      Composite < 0.35                    -> DIFFERENT
-    Thresholds tuned for real phone camera product images
-    with varying angles, lighting, and distances.
+    Multi-criteria decision — returns strictly SAME / DAMAGED / DIFFERENT.
+    Uses composite score + damage ratio for robust classification.
     """
     composite    = compute_composite_score(ssim, hist, texture, shape, damaged_px, total_px)
     damage_ratio = damaged_px / max(total_px, 1)
 
-    if composite > 0.55 and damage_ratio < 0.08:
-        return "SAME", composite
-    elif composite > 0.35 and ssim > 0.30:
-        if damage_ratio > 0.12:
-            return "DAMAGED", composite
-        elif shape < 0.5:
-            return "DIFFERENT", composite
+    # Strong histogram match = same product type
+    if hist > 0.85:
+        if damage_ratio < 0.10:
+            return "SAME", composite
         else:
             return "DAMAGED", composite
+
+    # Composite-based logic
+    if composite >= 0.40:
+        if damage_ratio <= 0.08:
+            return "SAME", composite
+        else:
+            return "DAMAGED", composite
+
+    elif composite >= 0.30:
+        if shape < 0.3 or hist < 0.4:
+            return "DIFFERENT", composite
+        return "DAMAGED", composite
+
     else:
         return "DIFFERENT", composite
 
