@@ -64,7 +64,9 @@ def extract_texture_features(gray_img):
     kernel = np.ones((9, 9), np.float32) / 81
     mean = cv2.filter2D(gray_img.astype(np.float32), -1, kernel)
     sqr_mean = cv2.filter2D((gray_img.astype(np.float32))**2, -1, kernel)
-    texture = np.sqrt(sqr_mean - mean**2)
+    variance = sqr_mean - mean**2
+    variance = np.clip(variance, 0, None)  # Prevent negative values from float precision
+    texture = np.sqrt(variance)
     
     # Normalize texture values
     texture = cv2.normalize(texture, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)

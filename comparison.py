@@ -57,18 +57,28 @@ def compute_ssim(img1, img2, mask1=None, mask2=None):
 
 def pixel_difference(img1, img2, mask1=None, mask2=None):
     """
-    Enhanced pixel-wise absolute difference (image subtraction).
-    Highlights regions where the two images differ.
-    Can focus on masked regions if masks are provided.
+    Pixel-wise absolute difference strictly on product region.
+    Background pixels (black = 0) are excluded from difference.
+    Combined product mask ensures diff map shows product changes only.
     """
     diff = cv2.absdiff(img1, img2)
-    
-    # If masks provided, focus difference calculation on product regions
+
+    # Build product-only mask from non-black pixels in both images
+    # Since background = black (0), non-zero pixels = product
+    auto_mask1 = (img1 > 0).astype(np.uint8) * 255
+    auto_mask2 = (img2 > 0).astype(np.uint8) * 255
+    auto_combined = cv2.bitwise_and(auto_mask1, auto_mask2)
+
+    # If explicit masks provided, intersect with auto mask
     if mask1 is not None and mask2 is not None:
-        combined_mask = cv2.bitwise_and(mask1, mask2)
-        # Apply mask to difference
-        diff = cv2.bitwise_and(diff, diff, mask=combined_mask)
-    
+        explicit_combined = cv2.bitwise_and(mask1, mask2)
+        final_mask = cv2.bitwise_and(auto_combined, explicit_combined)
+    else:
+        final_mask = auto_combined
+
+    # Zero out all background pixels in diff map
+    diff = cv2.bitwise_and(diff, diff, mask=final_mask)
+
     return diff
 
 
@@ -162,41 +172,62 @@ def compare_shape_features(shape1, shape2):
 
 def detect_damage(diff_img, mask1=None, mask2=None):
     """
-    Enhanced damage detection pipeline:
-    1. Thresholding   — isolate significant difference regions
-    2. Morphological dilation  — expand detected regions (fills small gaps)
-    3. Morphological erosion   — shrink back to remove noise
-    4. Focus on product regions using masks
-    Returns the cleaned binary mask and a count of damaged pixels.
+    Damage detection strictly on product region:
+    1. Build product mask from non-black pixels (background=black from preprocessing)
+    2. Adaptive threshold on product pixels only
+    3. Morphological dilation — expand damage regions
+    4. Morphological erosion  — remove noise
+    5. Strict mask: zero out any remaining background pixels
+    Returns clean damage mask (product region only) + damaged pixel count.
     """
-    # Step 1: Adaptive thresholding based on image statistics
-    mean_diff = np.mean(diff_img)
-    std_diff = np.std(diff_img)
-    threshold_value = max(30, mean_diff + 2 * std_diff)  # Adaptive threshold
-    
+    # Product mask: non-black pixels = product (background was set to 0)
+    auto_mask = (diff_img > 0).astype(np.uint8) * 255
+
+    if mask1 is not None and mask2 is not None:
+        explicit = cv2.bitwise_and(mask1, mask2)
+        product_mask = cv2.bitwise_and(auto_mask, explicit)
+    else:
+        product_mask = auto_mask
+
+    # Adaptive threshold only on product pixels
+    product_pixels = diff_img[product_mask > 0]
+    if len(product_pixels) == 0:
+        return np.zeros_like(diff_img), 0
+
+    mean_diff = float(np.mean(product_pixels))
+    std_diff  = float(np.std(product_pixels))
+    threshold_value = max(25, mean_diff + 1.5 * std_diff)
+
     _, thresh = cv2.threshold(diff_img, threshold_value, 255, cv2.THRESH_BINARY)
+
+    # Keep only product region in threshold result
+    thresh = cv2.bitwise_and(thresh, thresh, mask=product_mask)
 
     kernel = np.ones((5, 5), np.uint8)
 
-    # Step 2: Dilation — morphological operation to expand damage regions
+    # Dilation — expand damage regions, fill small gaps
     dilated = cv2.dilate(thresh, kernel, iterations=2)
 
-    # Step 3: Erosion — morphological operation to remove small noise blobs
+    # Erosion — remove small noise blobs
     eroded = cv2.erode(dilated, kernel, iterations=1)
-    
-    # Step 4: Focus on product regions if masks are available
-    if mask1 is not None and mask2 is not None:
-        combined_mask = cv2.bitwise_and(mask1, mask2)
-        eroded = cv2.bitwise_and(eroded, eroded, mask=combined_mask)
+
+    # Final strict mask — ensure zero background contamination
+    eroded = cv2.bitwise_and(eroded, eroded, mask=product_mask)
 
     damaged_pixels = int(np.sum(eroded > 0))
     return eroded, damaged_pixels
 
 
 def highlight_damage(color_img, damage_mask):
-    """Overlay damage mask on the color image in red for visualization."""
+    """
+    Overlay damage mask on the segmented product image in red.
+    Background pixels (black) are never highlighted — only product pixels.
+    """
     result = color_img.copy()
-    result[damage_mask > 0] = [0, 0, 255]  # Red highlight
+    # Only highlight where damage AND product pixel (non-black)
+    product_pixels = np.any(color_img > 0, axis=2)  # True where product exists
+    damage_region  = (damage_mask > 0) & product_pixels
+    result[damage_region] = [0, 0, 255]  # Red
     return result
 
 

@@ -8,11 +8,12 @@ import os
 import cv2
 import matplotlib.pyplot as plt
 
-from preprocessing import preprocess, preprocess_pair
+from preprocessing import preprocess
 from features import get_features
 from comparison import (
     compute_ssim, pixel_difference, compare_histograms,
-    detect_damage, highlight_damage, decide
+    detect_damage, highlight_damage, decide_enhanced,
+    compare_texture, compare_shape_features
 )
 
 DATASET_DIR = "dataset"
@@ -52,7 +53,8 @@ def compare_pair(orig_path, ret_path, show_plot=True):
     preprocess → feature extraction → comparison → damage detection → decision
     """
     # ── Preprocessing (UNIT 3) ──────────────────────────────────────────────
-    (orig_gray, orig_color), (ret_gray, ret_color) = preprocess_pair(orig_path, ret_path)
+    orig_gray, orig_color = preprocess(orig_path)
+    ret_gray,  ret_color  = preprocess(ret_path)
 
     # ── Feature Extraction (UNIT 4) ─────────────────────────────────────────
     orig_features = get_features(orig_gray)
