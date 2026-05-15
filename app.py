@@ -28,7 +28,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🔍 Fake Return Product Detector")
+st.title("🔍 Fake Return Product Identification")
 st.caption("Upload an original and a returned product image to detect fraud using Image Processing.")
 st.divider()
 
