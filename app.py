@@ -23,7 +23,7 @@ from comparison import (
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Fake Return Product Detector",
+    page_title="Fake Return Product Identification",
     page_icon="🔍",
     layout="wide"
 )
